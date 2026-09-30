@@ -1,0 +1,244 @@
+name: Tailscale 全架构自动编译发布
+
+on:
+  schedule:
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "忽略版本检测，强制编译并发布"
+        type: boolean
+        required: false
+        default: false
+      upx_compress:
+        description: "是否使用 UPX 压缩二进制文件"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tailscale-build-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: tailscale/tailscale
+
+jobs:
+  check-version:
+    name: 检测版本更新
+    runs-on: ubuntu-26.04
+    outputs:
+      need_build: ${{ steps.compare.outputs.need_build }}
+      latest_version: ${{ steps.latest.outputs.version }}
+      current_version: ${{ steps.current.outputs.version }}
+      upx_enabled: ${{ steps.opts.outputs.upx_enabled }}
+    steps:
+      - name: 拉取仓库代码（含全部标签）
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 读取本仓库最新标签版本
+        id: current
+        run: |
+          CURRENT=$(git tag --list 'v*' --sort=-v:refname | head -n1 | sed 's/^v//')
+          if [ -z "$CURRENT" ]; then
+            CURRENT="0.0.0"
+          fi
+          echo "当前仓库最新标签版本: $CURRENT"
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: 查询官方最新发行版本
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -r '.tag_name')
+          LATEST=${LATEST_TAG#v}
+          echo "官方最新版本: $LATEST"
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: 解析构建选项（是否启用 UPX）
+        id: opts
+        run: |
+          UPX_ENABLED="${{ inputs.upx_compress }}"
+          if [ -z "$UPX_ENABLED" ]; then UPX_ENABLED="true"; fi
+          echo "upx_enabled=$UPX_ENABLED" >> "$GITHUB_OUTPUT"
+
+      - name: 比较版本决定是否需要编译
+        id: compare
+        run: |
+          if [ "${{ steps.current.outputs.version }}" != "${{ steps.latest.outputs.version }}" ] || [ "${{ inputs.force_build }}" == "true" ]; then
+            echo "检测到更新，或手动强制编译，需要触发编译发布"
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "版本一致，无需编译"
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: 编译 ${{ matrix.arch_name }}
+    needs: check-version
+    if: needs.check-version.outputs.need_build == 'true'
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- x86 系列 ----
+          - { goos: linux, goarch: amd64, arch_name: x86_64 }
+          - { goos: linux, goarch: "386", arch_name: i686 }
+          # ---- ARM 系列 ----
+          - { goos: linux, goarch: arm64, arch_name: aarch64 }
+          - { goos: linux, goarch: arm, goarm: "7", arch_name: armv7l }
+          - { goos: linux, goarch: arm, goarm: "6", arch_name: armv6l }
+          - { goos: linux, goarch: arm, goarm: "5", arch_name: armv5l }
+          # ---- MIPS 系列 ----
+          - { goos: linux, goarch: mips, gomips: softfloat, arch_name: mips-softfloat }
+          - { goos: linux, goarch: mips, gomips: hardfloat, arch_name: mips-hardfloat }
+          - { goos: linux, goarch: mipsle, gomips: softfloat, arch_name: mipsel-softfloat }
+          - { goos: linux, goarch: mipsle, gomips: hardfloat, arch_name: mipsel-hardfloat }
+          - { goos: linux, goarch: mips64, gomips: softfloat, arch_name: mips64-softfloat }
+          - { goos: linux, goarch: mips64, gomips: hardfloat, arch_name: mips64-hardfloat }
+          - { goos: linux, goarch: mips64le, gomips: softfloat, arch_name: mips64el-softfloat }
+          - { goos: linux, goarch: mips64le, gomips: hardfloat, arch_name: mips64el-hardfloat }
+          # ---- PowerPC 系列（仅64位小端） ----
+          - { goos: linux, goarch: ppc64le, arch_name: powerpc64le }
+          # ---- 其他 ----
+          - { goos: linux, goarch: riscv64, arch_name: riscv64 }
+          - { goos: linux, goarch: loong64, arch_name: loongarch64 }
+    steps:
+      - name: 安装 Go 环境
+        uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+          check-latest: true
+          cache: false
+
+      - name: 拉取 tailscale 官方源码
+        run: |
+          VERSION="${{ needs.check-version.outputs.latest_version }}"
+          git clone --depth 1 --branch "v${VERSION}" https://github.com/${UPSTREAM_REPO}.git tailscale-src
+
+      - name: 安装 UPX
+        if: needs.check-version.outputs.upx_enabled == 'true'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
+
+      - name: 交叉编译二进制文件
+        id: build
+        working-directory: tailscale-src
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ needs.check-version.outputs.latest_version }}
+        run: |
+          set -e
+          TAGS="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_ssh,ts_omit_wakeonlan,ts_omit_capture,ts_omit_relayserver,ts_omit_systray,ts_omit_taildrop,ts_omit_tpm,ts_omit_syspolicy,ts_omit_debugeventbus,ts_omit_webclient"
+          LDFLAGS="-X 'tailscale.com/version.longStamp=${VERSION}-1 (OpenWrt)' -X 'tailscale.com/version.shortStamp=${VERSION}' -w -s"
+          ARTIFACT="linux-${{ matrix.arch_name }}"
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+
+          mkdir -p dist
+          go build -tags "$TAGS" -ldflags "$LDFLAGS" -trimpath -o "dist/tailscaled" ./cmd/tailscaled
+
+          ln -sf tailscaled dist/tailscale
+          echo "编译完成: $ARTIFACT"
+
+      - name: UPX 压缩二进制文件
+        if: needs.check-version.outputs.upx_enabled == 'true'
+        working-directory: tailscale-src
+        continue-on-error: true
+        run: |
+          upx --best --lzma "dist/tailscaled" || echo "该架构 UPX 不支持压缩，跳过"
+
+      - name: 打包产物
+        working-directory: tailscale-src
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+          VERSION: ${{ needs.check-version.outputs.latest_version }}
+        run: |
+          PKG_DIR="tailscale_${VERSION}_${ARTIFACT}"
+          mkdir -p "$PKG_DIR"
+          cp dist/tailscaled "$PKG_DIR"/
+          ln -sf tailscaled "$PKG_DIR"/tailscale
+          cp LICENSE "$PKG_DIR"/ 2>/dev/null || true
+          tar -czf "${PKG_DIR}.tar.gz" "$PKG_DIR"
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: tailscale-${{ matrix.arch_name }}
+          path: tailscale-src/tailscale_*.tar.gz
+          retention-days: 7
+
+  release:
+    name: 发布 Release
+    needs: [check-version, build]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 下载全部编译产物
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: 整理发布文件
+        run: |
+          mkdir -p release
+          find artifacts -type f -name "*.tar.gz" -exec cp {} release/ \;
+          ls -al release
+
+      - name: 创建并推送新标签
+        env:
+          VERSION: ${{ needs.check-version.outputs.latest_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "标签 v${VERSION} 已存在，跳过创建"
+          else
+            git tag -a "v${VERSION}" -m "Tailscale v${VERSION} 自动编译发布"
+            git push origin "v${VERSION}"
+          fi
+
+      - name: 生成 Release Notes
+        run: |
+          {
+            echo "## Tailscale v${{ needs.check-version.outputs.latest_version }} 全架构自动编译"
+            echo ""
+            echo "- 上游版本: v${{ needs.check-version.outputs.latest_version }}"
+            echo "- 本仓库此前记录版本: v${{ needs.check-version.outputs.current_version }}"
+            echo "- 本次更新时间(UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo "- UPX 压缩: ${{ needs.check-version.outputs.upx_enabled }}"
+            echo ""
+            echo "包含以下架构的二进制文件 (linux)："
+            echo ""
+            for f in release/*.tar.gz; do
+              echo "- $(basename "$f")"
+            done
+            echo ""
+          } > release_notes.md
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.check-version.outputs.latest_version }}
+          name: Tailscale v${{ needs.check-version.outputs.latest_version }} (全架构自动编译)
+          body_path: release_notes.md
+          files: release/*.tar.gz
+          make_latest: true
